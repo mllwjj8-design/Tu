@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的 Steam 图床</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #14161a; color: #e6e8eb;
+         font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { position: sticky; top: 0; z-index: 9; display: flex; align-items: baseline; gap: 12px;
+           padding: 14px 20px; background: rgba(20,22,26,.92); backdrop-filter: blur(8px);
+           border-bottom: 1px solid #24282e; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .3px; }
+  header .n { color: #8b939e; font-size: 12px; }
+  .grid { column-width: 240px; column-gap: 14px; padding: 14px; }
+  figure { margin: 0 0 14px; break-inside: avoid; border-radius: 8px; overflow: hidden;
+           background: #1c2026; cursor: zoom-in; position: relative; }
+  figure img { width: 100%; display: block; transition: transform .25s ease, opacity .3s; opacity: 0; }
+  figure img.ok { opacity: 1; }
+  figure:hover img { transform: scale(1.03); }
+  figcaption { position: absolute; left: 0; right: 0; bottom: 0; padding: 6px 8px; font-size: 11px;
+               color: #b9c0c9; background: linear-gradient(transparent, rgba(0,0,0,.75));
+               opacity: 0; transition: opacity .2s; }
+  figure:hover figcaption { opacity: 1; }
+  #viewer { position: fixed; inset: 0; background: rgba(8,9,11,.94); display: none;
+            align-items: center; justify-content: center; z-index: 99; cursor: zoom-out; padding: 24px; }
+  #viewer.on { display: flex; }
+  #viewer img { max-width: 100%; max-height: 100%; box-shadow: 0 8px 40px rgba(0,0,0,.6); }
+  footer { padding: 10px 20px 40px; color: #6b7480; font-size: 12px; }
+  footer a { color: #7aa2d6; }
+  .err { padding: 48px 24px; color: #d98a8a; line-height: 1.9; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>我的 Steam 图床</h1>
+  <span class="n">共 <b id="count">0</b> 张</span>
+</header>
+<div class="grid" id="grid"></div>
+<footer>图片存放于 Steam 图片 CDN（images.steamusercontent.com）。索引：r.json</footer>
+<div id="viewer"><img alt=""></div>
+<script>
+const CDN = "https://images.steamusercontent.com/ugc/";
+const grid = document.getElementById("grid");
+function render(PICS) {
+  document.getElementById("count").textContent = PICS.length;
+  PICS.forEach((p, i) => {
+    const url = CDN + p;
+    const fig = document.createElement("figure");
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.src = url;
+    img.onload = () => img.classList.add("ok");
+    img.onerror = () => { fig.style.display = "none"; };
+    const cap = document.createElement("figcaption");
+    cap.textContent = "#" + String(i + 1).padStart(3, "0");
+    fig.append(img, cap);
+    fig.onclick = () => {
+      const v = document.getElementById("viewer");
+      v.querySelector("img").src = url;
+      v.classList.add("on");
+    };
+    grid.appendChild(fig);
+  });
+}
+document.getElementById("viewer").onclick = e => e.currentTarget.classList.remove("on");
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") document.getElementById("viewer").classList.remove("on");
+});
+(async () => {
+  try {
+    const res = await fetch("r.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    const pics = Array.isArray(d) ? d : (d.pics || []);
+    if (!pics.length) throw new Error("索引为空");
+    render(pics);
+  } catch (e) {
+    grid.innerHTML = '<p class="err">读取索引失败：' + e.message +
+      '<br>若你是用 file:// 直接双击打开的，请改用本地服务器或访问线上地址。</p>';
+  }
+})();
+</script>
+</body>
+</html>
