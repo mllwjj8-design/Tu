@@ -27,7 +27,6 @@ jobs:
         run: |
           if git diff --quiet -- r.json; then
             echo "索引没有变化，跳过提交"
-            echo "::warning::没有可提交的变更（可能是全部失效被安全阀拦下，见上一步日志）"
             exit 0
           fi
           git config user.name  "steambed-bot"
