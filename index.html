@@ -94,10 +94,21 @@
          padding:8px 16px;border-radius:9px;font-size:13px;opacity:0;pointer-events:none;
          transition:opacity .2s,transform .2s;z-index:120}
   #toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+  /* 分类标签栏：只有配置了 categories 才会出现 */
+  #cats{display:none;gap:6px;flex-wrap:wrap;padding:8px 20px 10px;
+        border-bottom:1px solid var(--line);background:var(--panel)}
+  #cats.on{display:flex}
+  #cats button{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+               border-radius:999px;padding:4px 12px;font-size:12px;cursor:pointer;
+               line-height:1.5;font-family:inherit}
+  #cats button:hover{border-color:var(--accent)}
+  #cats button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  #cats button .n{opacity:.65;margin-left:5px;font-size:11px}
   @media (max-width:640px){
     main{grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;padding:12px}
     input[type=search]{width:120px}
     #lbImg{max-width:100%;max-height:calc(100% - 130px)}
+    #cats{padding:8px 12px 10px}
   }
 </style>
 </head>
@@ -113,6 +124,8 @@
   </div>
   <div class="sub" id="sub"></div>
 </header>
+
+<nav id="cats"></nav>
 
 <main id="grid"></main>
 <nav id="pager"></nav>
@@ -137,6 +150,7 @@ const PER = 60;
 const THUMB = "?imw=520&imh=520&impolicy=Letterbox";
 
 let PICS = [], view = [], page = 1, sel = new Set(), selMode = false, lbIdx = -1;
+let CATS = [], DATA = {}, curCat = "";
 
 const $ = s => document.querySelector(s);
 const grid = $("#grid"), pager = $("#pager");
@@ -147,20 +161,79 @@ function toast(msg){
   clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("on"), 1800);
 }
 
+function setCats(list){
+  CATS = (list || []).filter(c => c && c.slug && c.index);
+  const nav = $("#cats");
+  nav.innerHTML = "";
+  if (!CATS.length){ nav.classList.remove("on"); return; }
+  CATS.forEach(c => {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.slug = c.slug;
+    b.appendChild(document.createTextNode(c.name || c.slug));
+    if (typeof c.count === "number"){
+      const n = document.createElement("span");
+      n.className = "n"; n.textContent = c.count;
+      b.appendChild(n);
+    }
+    b.addEventListener("click", () => pickCat(c.slug));
+    nav.appendChild(b);
+  });
+  nav.classList.add("on");
+}
+
 function boot(pics){
   PICS = (pics || []).filter(Boolean);
   $("#count").textContent = "共 " + PICS.length + " 张";
+  // 换类目后旧的勾选跨类残留会很危险（下载到的可能是别的类里的同名序号），一律清空
+  sel.clear(); updateSel();
+  document.querySelectorAll(".card").forEach(c => c.classList.remove("picked"));
   apply();
 }
 
-function load(){
-  fetch("r.json", { cache: "no-store" })
-    .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+function pickCat(slug){
+  const c = CATS.find(x => x.slug === slug) || CATS[0];
+  if (!c) return;
+  curCat = c.slug;
+  document.querySelectorAll("#cats button").forEach(b =>
+    b.classList.toggle("on", b.dataset.slug === c.slug));
+  if (DATA[c.index]){ boot(DATA[c.index]); return; }   // 本地内联模式
+  grid.innerHTML = '<p class="empty">载入中…</p>';
+  fetch(c.index, { cache: "no-store" })
+    .then(r => { if (!r.ok) throw new Error(c.index + " HTTP " + r.status); return r.json(); })
     .then(d => boot(Array.isArray(d) ? d : d.pics))
     .catch(e => {
-      grid.innerHTML = '<p class="empty">读取索引失败：' + e.message +
-        '<br>若是 file:// 直接双击打开的，请改用 gallery.html 或本地服务器。</p>';
+      grid.innerHTML = '<p class="empty">读取 ' + c.index + ' 失败：' + e.message + '</p>';
     });
+}
+
+// 线上：先读类目清单，再按类目拉对应的索引文件。
+// categories.json 不存在（老站点 / 没配分类）时退化成只读 r.json，行为跟以前一致。
+function load(){
+  fetch("categories.json", { cache: "no-store" })
+    .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(d => {
+      if (!d || !Array.isArray(d.categories) || !d.categories.length) throw new Error("无类目");
+      setCats(d.categories);
+      pickCat("all");
+    })
+    .catch(() => {
+      setCats([]);
+      fetch("r.json", { cache: "no-store" })
+        .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(d => boot(Array.isArray(d) ? d : d.pics))
+        .catch(e => {
+          grid.innerHTML = '<p class="empty">读取索引失败：' + e.message +
+            '<br>若是 file:// 直接双击打开的，请改用 gallery.html 或本地服务器。</p>';
+        });
+    });
+}
+
+// 本地：所有索引内容都内联在 DATA 里，双击就能开，不需要服务器
+function bootInline(data){
+  DATA = data || {};
+  setCats(DATA.__cats || []);
+  if (CATS.length) pickCat("all");
+  else boot(DATA["r.json"] || []);
 }
 
 function apply(){

@@ -1,0 +1,41 @@
+{
+  "title": "我的图床",
+  "total": 0,
+  "categories": [
+    {
+      "slug": "all",
+      "name": "全部",
+      "count": 0,
+      "index": "r.json",
+      "full": "full.json"
+    },
+    {
+      "slug": "scenery",
+      "name": "风景",
+      "count": 0,
+      "index": "r.scenery.json",
+      "full": "full.scenery.json"
+    },
+    {
+      "slug": "character",
+      "name": "人物",
+      "count": 0,
+      "index": "r.character.json",
+      "full": "full.character.json"
+    },
+    {
+      "slug": "anime",
+      "name": "二次元",
+      "count": 0,
+      "index": "r.anime.json",
+      "full": "full.anime.json"
+    },
+    {
+      "slug": "other",
+      "name": "未分类",
+      "count": 0,
+      "index": "r.other.json",
+      "full": "full.other.json"
+    }
+  ]
+}

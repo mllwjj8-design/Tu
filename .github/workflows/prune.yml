@@ -27,19 +27,22 @@ jobs:
       - name: 探测并剔除失效链接
         id: prune
         continue-on-error: true
-        run: python tools/prune.py --src r.json --apply --source action
+        # --site . 会把 full.json 和每个类目的 r.*.json / full.*.json 一起同步清理，
+        # 否则分类索引里会留下 r.json 已经删掉的幽灵条目
+        run: python tools/prune.py --src r.json --site . --apply --source action
 
       - name: 有变化就提交
         run: |
-          if [ -z "$(git status --porcelain -- r.json deleted_history.json deleted_history.md)" ]; then
+          if [ -z "$(git status --porcelain)" ]; then
             echo "索引与删图记录都没有变化，跳过提交"
             exit 0
           fi
-          rm -f r.json.bak
+          rm -f *.bak
           git config user.name  "steambed-bot"
           git config user.email "steambed-bot@users.noreply.github.com"
-          git add r.json
-          git add deleted_history.json deleted_history.md 2>/dev/null || true
+          # 分类索引是动态的（r.*.json / full.*.json），逐个列出来容易漏，直接全加。
+          # 仓库里只有站点文件，*.bak 已被 .gitignore 挡住，不会误提交。
+          git add -A
           n=$(python -c "import json;print(json.load(open('deleted_history.json')).get('count',0))" 2>/dev/null || echo "?")
           git commit -m "prune: 移除已失效的图片链接（删图记录累计 ${n} 条）"
           if ! git push origin HEAD; then

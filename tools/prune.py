@@ -417,13 +417,93 @@ def confirm_dead(paths: list[str], host: str = DEFAULT_HOST, *, rounds: int = 2,
     return confirmed, revived, unsure
 
 
+def _path_of(entry: object) -> str | None:
+    """把索引里的一行统一成 UGC 路径。
+
+    r.json 里是裸路径，full.json 里是完整 URL，两种都要认。
+    """
+    s = str(entry or "").strip()
+    if not s:
+        return None
+    return _ugc_path(s) or s
+
+
+def _strip_dead(data: dict, dead_set: set[str]) -> int:
+    """从一份索引里删掉死链，返回删了几条。只动 pics / items，其它键原样保留。"""
+    removed = 0
+    if isinstance(data.get("pics"), list):
+        kept = []
+        for p in data["pics"]:
+            if _path_of(p) in dead_set:
+                removed += 1
+            else:
+                kept.append(p)
+        data["pics"] = kept
+    if isinstance(data.get("items"), list):
+        kept = []
+        for it in data["items"]:
+            if _ugc_path(str(it.get("url") or "")) in dead_set:
+                removed += 1
+            else:
+                kept.append(it)
+        data["items"] = kept
+    return removed
+
+
+CATEGORIES_NAME = "categories.json"
+
+
+def refresh_category_counts(site_dir: Path) -> bool:
+    """按实际索引文件重算 categories.json 里的条数。
+
+    分类文件的条数是在 export 时写死的，Action 悄悄剔了几条之后，
+    画廊标签上还挂着旧数字 —— 那种"明明删除成功了但页面显示没变"最容易被当成故障。
+    """
+    f = Path(site_dir) / CATEGORIES_NAME
+    if not f.is_file():
+        return False
+    try:
+        d = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(d, dict) or not isinstance(d.get("categories"), list):
+        return False
+
+    def size(idx: str) -> int | None:
+        p = Path(site_dir) / idx
+        if not p.is_file():
+            return None
+        try:
+            v = json.loads(p.read_text(encoding="utf-8")).get("pics")
+            return len(v) if isinstance(v, list) else None
+        except Exception:
+            return None
+
+    changed = False
+    for c in d["categories"]:
+        if not isinstance(c, dict) or not c.get("index"):
+            continue
+        n = size(str(c["index"]))
+        if n is not None and c.get("count") != n:
+            c["count"] = n
+            changed = True
+    total = size("r.json")
+    if total is not None and d.get("total") != total:
+        d["total"] = total
+        changed = True
+    if changed:
+        atomic_write(f, json.dumps(d, ensure_ascii=False, indent=2) + "\n")
+        print(f"[同步] 已按实际条数更新 {CATEGORIES_NAME}")
+    return changed
+
+
 def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
                threads: int = 4, dry_run: bool = False, force: bool = False,
                max_ratio: float = 0.5, min_total: int = 10,
                quiet: bool = False, history: Path | None = None,
                write_history: bool = True, source: str = "local",
                confirm: int = 2, confirm_delay: float = 1.2,
-               cross_host: bool = True) -> int:
+               cross_host: bool = True, extra: list[Path] | None = None) -> int:
     """探测并剔除 src 里的失效条目。支持两种文件格式：
 
       {"pics":  ["<ugc 路径>", ...]}                  —— 站点索引 r.json
@@ -554,6 +634,28 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
     atomic_write(src, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     print(f"[完成] 已剔除 {len(dead)} 条，写回 {src}（备份 {bak.name}）")
 
+    # 同一批死链也要从分类索引和 full.json 里摘掉，否则站点上会出现
+    # "r.json 里没有、r.风景.json 里还在" 的幽灵条目 —— 壁纸软件正好读到那份就白屏。
+    # 这些文件是同一次 export 出来的子集，不需要再探测一遍，直接按路径过滤即可。
+    for f in (extra or []):
+        try:
+            fp = Path(f)
+            if not fp.is_file() or fp.resolve() == src.resolve():
+                continue
+            d2 = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(d2, dict):
+                continue
+            n2 = _strip_dead(d2, dead_set)
+            if n2:
+                atomic_write(fp.with_suffix(fp.suffix + ".bak"),
+                             fp.read_text(encoding="utf-8"))
+                atomic_write(fp, json.dumps(d2, ensure_ascii=False, indent=2) + "\n")
+                print(f"[同步] {fp.name} 又摘掉 {n2} 条")
+        except Exception as e:
+            print(f"[警告] 同步 {f} 失败（未改动）：{e}", file=sys.stderr)
+
+    refresh_category_counts(src.parent)
+
     if write_history:
         hp = history or src.with_name(HISTORY_NAME)
         records = [
@@ -566,6 +668,26 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
         extra = f"，{skipped} 条此前已有记录" if skipped else ""
         print(f"[记录] 已写入 {hp}（本次新增 {added} 条{extra}，累计 {total_kept} 条）")
     return 0
+
+
+def site_index_files(site_dir: Path, exclude: Path | None = None) -> list[Path]:
+    """站点目录里需要跟着一起清理的索引：full.json 和每个类目的 r.*.json / full.*.json。
+
+    只认 r.json / r.<slug>.json / full.json / full.<slug>.json 这四种形状，
+    免得把 deleted_history.json、categories.json 之类误当成图库索引去删。
+    """
+    out: list[Path] = []
+    d = Path(site_dir)
+    if not d.is_dir():
+        return out
+    ex = exclude.resolve() if exclude else None
+    for p in sorted(d.glob("*.json")):
+        if not re.fullmatch(r"(?:r|full)(?:\.[a-z0-9_-]+)?\.json", p.name):
+            continue
+        if ex and p.resolve() == ex:
+            continue
+        out.append(p)
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -591,7 +713,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="复核每轮之间隔几秒（默认 1.2）")
     ap.add_argument("--no-cross-check", action="store_true",
                     help="不复用旧域名做交叉验证")
+    ap.add_argument("--extra", nargs="*", default=[],
+                    help="额外同步处理的索引文件（full.json、各类目的 r.*.json）")
+    ap.add_argument("--site", help="站点目录：自动把里面的 full.json / r.*.json / full.*.json 一并同步")
     a = ap.parse_args(argv)
+
+    extra = [Path(p) for p in (a.extra or [])]
+    if a.site:
+        extra += site_index_files(Path(a.site), Path(a.src))
 
     return prune_file(
         Path(a.src), host=a.host, delay=a.delay, threads=a.threads,
@@ -600,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
         history=Path(a.history) if a.history else None,
         write_history=not a.no_history, source=a.source,
         confirm=a.confirm, confirm_delay=a.confirm_delay,
-        cross_host=not a.no_cross_check,
+        cross_host=not a.no_cross_check, extra=extra,
     )
 
 
