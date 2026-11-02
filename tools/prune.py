@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""prune_core.py —— Steam 图床索引的失效链接探测与剔除（唯一实现）
+
+本地 `steambed.py prune/sync` 与 GitHub Action 都调用这一份代码，
+避免"本地判活、云端判死"这类两套逻辑不一致的问题。
+
+判定规则（重要）：
+  只有 404 / 410 才算"文件真的没了"。
+  429 / 5xx / 403 / 超时 / DNS 失败，一律记为 unknown 并**保留**条目 ——
+  一次限流或网络抖动就把整个索引清空，是这套工具最容易踩的坑。
+
+两道安全阀：
+  1. 全部失效 -> 拒绝剔除
+  2. 失效比例 > --max-ratio（默认 50%）且总数 >= --min-total（默认 10）-> 拒绝剔除
+     （确认无误时加 --force 跳过）
+
+退出码：0 成功 / 1 出错 / 2 被安全阀拦下
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+DEFAULT_HOST = "images.steamusercontent.com"
+UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+ALIVE, DEAD, UNKNOWN = "alive", "dead", "unknown"
+
+# 有些图在 Range 请求下返回 application/octet-stream，
+# 单看 Content-Type 会误判，所以再看文件头。
+_MAGIC = (
+    b"\xff\xd8\xff",      # jpeg
+    b"\x89PNG\r\n\x1a\n",  # png
+    b"GIF8",              # gif
+    b"BM",                # bmp
+    b"RIFF",              # webp
+)
+
+
+def looks_like_image(body: bytes) -> bool:
+    return any(body.startswith(m) for m in _MAGIC)
+
+
+def cache_busted(url: str) -> str:
+    """挂随机查询串强制 CDN 回源。
+
+    CDN 返回 Cache-Control: max-age=604800（7 天）。删图后边缘节点仍会继续
+    返回 200，不加这一下会把死链判成活的。
+    """
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}prune={int(time.time() * 1000)}{random.randrange(1000, 9999)}"
+
+
+def probe_image(url: str, timeout: float = 15.0, retries: int = 2) -> tuple[str, str]:
+    """探测单个图片地址，返回 (状态, 说明)。只取前 4KB，不下载整张图。"""
+    headers = dict(UA)
+    headers["Range"] = "bytes=0-4095"
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            with urlopen(Request(cache_busted(url), headers=headers), timeout=timeout) as r:
+                body = r.read(4096)
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if ctype.startswith("image/"):
+                    if len(body) < 64:
+                        return UNKNOWN, f"HTTP {r.status} 但响应体过短"
+                    return ALIVE, f"HTTP {r.status} {ctype}"
+                if looks_like_image(body):
+                    return ALIVE, f"HTTP {r.status} {ctype or 'octet-stream'}（按文件头判定）"
+                return UNKNOWN, f"HTTP {r.status} 但类型是 {ctype or '未知'}"
+        except HTTPError as e:
+            if e.code in (404, 410):
+                return DEAD, f"HTTP {e.code}"
+            # 403 可能是地区封锁，429 是限流，5xx 是服务端抖动 —— 都不能当删除
+            return UNKNOWN, f"HTTP {e.code}"
+        except Exception as e:  # 超时、DNS、连接重置
+            last = f"{type(e).__name__}: {str(e)[:60]}"
+            if attempt < retries:
+                time.sleep(0.8 * (attempt + 1))
+    return UNKNOWN, last or "探测失败"
+
+
+def classify(pics: list[str], host: str = DEFAULT_HOST, *, delay: float = 0.15,
+             threads: int = 4, quiet: bool = False) -> dict[str, tuple[str, str]]:
+    """并发探测一批 UGC 路径，返回 {path: (状态, 说明)}。"""
+    host = host.rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = "https://" + host
+    total = len(pics)
+    done = 0
+    result: dict[str, tuple[str, str]] = {}
+
+    def work(path: str) -> tuple[str, str, str]:
+        # 打散起始时间，避免同一瞬间打出 N 个请求
+        time.sleep(random.uniform(0, max(delay, 0)))
+        state, detail = probe_image(f"{host}/ugc/{path}")
+        return path, state, detail
+
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        for path, state, detail in pool.map(work, pics):
+            done += 1
+            result[path] = (state, detail)
+            if not quiet:
+                tag = {ALIVE: "存活", DEAD: "失效", UNKNOWN: "未知"}[state]
+                mark = {ALIVE: "  ", DEAD: "! ", UNKNOWN: "? "}[state]
+                label = path[:44].ljust(44)
+                print(f"  {mark}[{done:>4}/{total}] {label} {tag}  {detail}")
+    return result
+
+
+def _ugc_path(url: str) -> str | None:
+    m = re.search(r"/ugc/(.+?)/?$", url or "")
+    if not m:
+        return None
+    p = m.group(1)
+    return p if p.endswith("/") else p + "/"
+
+
+def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
+               threads: int = 4, dry_run: bool = False, force: bool = False,
+               max_ratio: float = 0.5, min_total: int = 10,
+               quiet: bool = False) -> int:
+    """探测并剔除 src 里的失效条目。支持两种文件格式：
+
+      {"pics":  ["<ugc 路径>", ...]}                  —— 站点索引 r.json
+      {"items": [{"url": "https://.../ugc/..."}, ...]} —— 抓取清单 urls.json
+    """
+    if not src.is_file():
+        print(f"[错误] 找不到 {src}", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(src.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[错误] 解析 {src} 失败：{e}", file=sys.stderr)
+        return 1
+    if not isinstance(data, dict):
+        print(f"[错误] {src} 的顶层不是对象", file=sys.stderr)
+        return 1
+
+    is_pics = isinstance(data.get("pics"), list)
+    is_items = isinstance(data.get("items"), list)
+    if not is_pics and not is_items:
+        print(f"[错误] {src} 里既没有 pics 也没有 items", file=sys.stderr)
+        return 1
+
+    pics: list[str] = list(data["pics"]) if is_pics else []
+    items: list[dict] = list(data["items"]) if is_items else []
+
+    # 统一成"待探测的 UGC 路径"
+    targets: list[str] = list(pics) if is_pics else []
+    for it in items:
+        p = _ugc_path(str(it.get("url") or ""))
+        if p and p not in targets:
+            targets.append(p)
+
+    total = len(targets)
+    if total == 0:
+        print("[跳过] 清单为空，无需探测")
+        return 0
+
+    print(f"[探测] {total} 条，{threads} 线程，已绕过 CDN 缓存")
+    result = classify(targets, host, delay=delay, threads=threads, quiet=quiet)
+
+    dead = [p for p in targets if result[p][0] == DEAD]
+    unknown = [p for p in targets if result[p][0] == UNKNOWN]
+    alive = [p for p in targets if result[p][0] == ALIVE]
+
+    print()
+    print(f"[结果] 存活 {len(alive)} · 失效 {len(dead)} · 未知 {len(unknown)}")
+    if dead:
+        print("[失效明细]")
+        for p in dead:
+            print(f"  - {p}  ({result[p][1]})")
+    if unknown:
+        print("[未知（已保留，不算删除）]")
+        for p in unknown[:10]:
+            print(f"  ? {p}  ({result[p][1]})")
+        if len(unknown) > 10:
+            print(f"  ... 另有 {len(unknown) - 10} 条")
+
+    if not dead:
+        print("[完成] 没有需要剔除的条目")
+        return 0
+
+    # ---- 安全阀 ----
+    if len(dead) == total and not force:
+        print("[中止] 全部条目都失效，这更像是网络/账号问题，而不是图全删了。", file=sys.stderr)
+        print("       确认要清空索引时，加 --force 重跑。", file=sys.stderr)
+        return 2
+    if not force and total >= min_total and len(dead) / total > max_ratio:
+        print(f"[中止] 本次失效 {len(dead)}/{total}，超过阈值 {max_ratio:.0%}。", file=sys.stderr)
+        print("       可能是 CDN 对我们限流了。确认无误时加 --force 重跑。", file=sys.stderr)
+        return 2
+
+    if dry_run:
+        print(f"[预演] 只报告不改文件。实际会剔除 {len(dead)} 条，加 --apply 才写入")
+        return 0
+
+    dead_set = set(dead)
+    if is_pics:
+        data["pics"] = [p for p in data["pics"] if p not in dead_set]
+    if is_items:
+        kept = []
+        for it in data["items"]:
+            p = _ugc_path(str(it.get("url") or ""))
+            if p in dead_set:
+                continue
+            kept.append(it)
+        data["items"] = kept
+
+    bak = src.with_suffix(src.suffix + ".bak")
+    bak.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    # 注意：只改 pics / items 两个字段，其它键原样保留，文件形状不变
+    src.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"[完成] 已剔除 {len(dead)} 条，写回 {src}（备份 {bak.name}）")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="prune",
+        description="探测 Steam 图片 CDN 直链并剔除已失效的条目（GitHub Action 与本地共用）")
+    ap.add_argument("--src", default="r.json", help="要处理的 JSON（默认 r.json）")
+    ap.add_argument("--host", default=DEFAULT_HOST, help="图片 CDN 域名")
+    ap.add_argument("--delay", type=float, default=0.15, help="每条请求的随机延迟上限（秒）")
+    ap.add_argument("--threads", type=int, default=4, help="并发线程数（默认 4，别开太大）")
+    ap.add_argument("--dry-run", action="store_true", help="只报告，不写文件")
+    ap.add_argument("--apply", action="store_true", help="确认写入（不加则等同预演）")
+    ap.add_argument("--force", action="store_true", help="跳过安全阀（全部失效/超阈值时仍剔除）")
+    ap.add_argument("--max-ratio", type=float, default=0.5, help="单次允许的失效比例上限")
+    ap.add_argument("--min-total", type=int, default=10, help="低于这个总数不套用比例阈值")
+    ap.add_argument("--quiet", action="store_true", help="不逐条打印")
+    a = ap.parse_args(argv)
+
+    return prune_file(
+        Path(a.src), host=a.host, delay=a.delay, threads=a.threads,
+        dry_run=a.dry_run or not a.apply, force=a.force,
+        max_ratio=a.max_ratio, min_total=a.min_total, quiet=a.quiet,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

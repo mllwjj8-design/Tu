@@ -1,0 +1,37 @@
+name: prune
+
+on:
+  schedule:
+    - cron: "17 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 探测并剔除失效链接
+        id: prune
+        continue-on-error: true
+        run: python tools/prune.py --src r.json --apply
+
+      - name: 有变化就提交
+        run: |
+          if git diff --quiet -- r.json; then
+            echo "索引没有变化，跳过提交"
+            echo "::warning::没有可提交的变更（可能是全部失效被安全阀拦下，见上一步日志）"
+            exit 0
+          fi
+          git config user.name  "steambed-bot"
+          git config user.email "steambed-bot@users.noreply.github.com"
+          git add r.json
+          git commit -m "prune: 移除已失效的图片链接"
+          git push
