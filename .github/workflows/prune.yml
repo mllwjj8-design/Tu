@@ -42,4 +42,8 @@ jobs:
           git add deleted_history.json deleted_history.md 2>/dev/null || true
           n=$(python -c "import json;print(json.load(open('deleted_history.json')).get('count',0))" 2>/dev/null || echo "?")
           git commit -m "prune: 移除已失效的图片链接（删图记录累计 ${n} 条）"
-          git push origin HEAD
+          if ! git push origin HEAD; then
+            echo "推送被拒（多半是本地刚手动推过），rebase 后重试"
+            git pull --rebase origin "${GITHUB_REF_NAME:-main}"
+            git push origin HEAD
+          fi

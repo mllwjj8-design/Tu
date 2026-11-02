@@ -6,19 +6,23 @@
 避免"本地判活、云端判死"这类两套逻辑不一致的问题。
 
 判定规则（重要）：
-  只有 404 / 410 才算"文件真的没了"。
+  只有 404 / 410 才算"文件真的没了"，而且必须**复核确认**：
+  首次判死后隔一会儿再探两轮，任何一轮活过来就撤销；主域名连续 404 时还会去
+  旧域名（steamuserimages-a.akamaihd.net）试一次，能出图同样撤销。
   429 / 5xx / 403 / 超时 / DNS 失败，一律记为 unknown 并**保留**条目 ——
   一次限流或网络抖动就把整个索引清空，是这套工具最容易踩的坑。
 
-两道安全阀：
+三道安全阀：
   1. 全部失效 -> 拒绝剔除
   2. 失效比例 > --max-ratio（默认 50%）且总数 >= --min-total（默认 10）-> 拒绝剔除
+  3. 一条活的都没有、却还有一堆探测失败 -> 拒绝剔除（典型的地区封锁/网络故障）
      （确认无误时加 --force 跳过）
 
 删图记录：
   每次剔除都会把条目追加进 deleted_history.json（只增不删、按时间倒序、按路径去重），
   所以"删了哪些、什么时候删的、当时报什么错"永远查得到，即使 r.json 早已清空。
   本地与 Action 写的是同一份结构，export 会把两份合并成站点里的那一份。
+  误删了可以用 `steambed.py restore` 把它放回清单（会先复核，确实活着才放回）。
 
 退出码：0 成功 / 1 出错 / 2 被安全阀拦下
 """
@@ -27,9 +31,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -38,6 +44,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 DEFAULT_HOST = "images.steamusercontent.com"
+LEGACY_HOST = "steamuserimages-a.akamaihd.net"  # 老图可能存在这个域名上
 HISTORY_NAME = "deleted_history.json"
 BJ_TZ = timezone(timedelta(hours=8))  # 删图时间统一按北京时间记录
 UA = {
@@ -65,6 +72,27 @@ def looks_like_image(body: bytes) -> bool:
     return any(body.startswith(m) for m in _MAGIC)
 
 
+def atomic_write(path: Path, text: str) -> None:
+    """先写临时文件再替换。写到一半断电/被杀进程，也不会留下半截 JSON。
+
+    Action 里 `git add` 读到半截 r.json 会直接毁掉线上索引，这个坑必须堵。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def cache_busted(url: str) -> str:
     """挂随机查询串强制 CDN 回源。
 
@@ -75,8 +103,13 @@ def cache_busted(url: str) -> str:
     return f"{url}{sep}prune={int(time.time() * 1000)}{random.randrange(1000, 9999)}"
 
 
-def probe_image(url: str, timeout: float = 15.0, retries: int = 2) -> tuple[str, str]:
-    """探测单个图片地址，返回 (状态, 说明)。只取前 4KB，不下载整张图。"""
+def probe_image(url: str, timeout: float = 15.0, retries: int = 2,
+                retry_server_errors: bool = True) -> tuple[str, str]:
+    """探测单个图片地址，返回 (状态, 说明)。只取前 4KB，不下载整张图。
+
+    注意：这里**不会**因为重试而放宽判定 —— 404 第一次就返回 DEAD，
+    真正防误判的是上层的 confirm_dead() 复核。
+    """
     headers = dict(UA)
     headers["Range"] = "bytes=0-4095"
     last = ""
@@ -95,7 +128,12 @@ def probe_image(url: str, timeout: float = 15.0, retries: int = 2) -> tuple[str,
         except HTTPError as e:
             if e.code in (404, 410):
                 return DEAD, f"HTTP {e.code}"
-            # 403 可能是地区封锁，429 是限流，5xx 是服务端抖动 —— 都不能当删除
+            # 429 限流、5xx 服务端抖动：值得再试一次，仍失败才记未知
+            if retry_server_errors and e.code in (429, 500, 502, 503, 504) and attempt < retries:
+                last = f"HTTP {e.code}"
+                time.sleep(1.0 * (attempt + 1) + random.uniform(0, 0.5))
+                continue
+            # 403 可能是地区封锁 —— 同样不能当删除
             return UNKNOWN, f"HTTP {e.code}"
         except Exception as e:  # 超时、DNS、连接重置
             last = f"{type(e).__name__}: {str(e)[:60]}"
@@ -193,16 +231,14 @@ def save_history(path: Path, data: dict, *, write_md: bool = True) -> bool:
 
     changed = old != text
     if changed:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        atomic_write(path, text)
 
     if write_md:
         md_path = path.with_suffix(".md")
         md = render_history_md(out)
         old_md = md_path.read_text(encoding="utf-8") if md_path.is_file() else ""
         if md != old_md:
-            md_path.parent.mkdir(parents=True, exist_ok=True)
-            md_path.write_text(md, encoding="utf-8")
+            atomic_write(md_path, md)
 
     return changed
 
@@ -240,6 +276,18 @@ def merge_history(dst: Path, *extra: Path) -> int:
                 by_path[p] = it
     save_history(dst, {"version": 1, "items": list(by_path.values())})
     return len(by_path)
+
+
+def forget_history(history: Path, path: str) -> bool:
+    """从删图记录里移除一条（restore 用）。返回是否真的删掉了。"""
+    data = load_history(history)
+    before = data.get("items") or []
+    kept = [it for it in before if str(it.get("path") or "") != path]
+    if len(kept) == len(before):
+        return False
+    data["items"] = kept
+    save_history(history, data)
+    return True
 
 
 def _record(path: str, detail: str, host: str, *, source: str,
@@ -286,19 +334,96 @@ def classify(pics: list[str], host: str = DEFAULT_HOST, *, delay: float = 0.15,
     return result
 
 
-def _ugc_path(url: str) -> str | None:
-    m = re.search(r"/ugc/(.+?)/?$", url or "")
+def ugc_path(url: str) -> str | None:
+    """从任意 Steam 图片地址里取出 UGC 路径片段。
+
+    先砍掉 ?imw=512 这类查询串，否则路径里会混进 "?imw=512"，
+    拼出来的探测地址和写进 r.json 的路径都是坏的。
+    """
+    if not url:
+        return None
+    clean = str(url).strip().split("#", 1)[0].split("?", 1)[0]
+    m = re.search(r"/ugc/(.+?)/?$", clean)
     if not m:
         return None
-    p = m.group(1)
-    return p if p.endswith("/") else p + "/"
+    p = m.group(1).strip("/")
+    return (p + "/") if p else None
+
+
+# 旧名字，兼容已有调用
+_ugc_path = ugc_path
+
+
+def confirm_dead(paths: list[str], host: str = DEFAULT_HOST, *, rounds: int = 2,
+                 delay: float = 1.2, cross_host: bool = True, threads: int = 4,
+                 quiet: bool = False) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """复核首次判死的条目 —— 这是防"图没删却被当成删了"的关键一步。
+
+    每条都要隔一段时间再探 rounds 轮：
+      · 任意一轮出图   -> 撤销（误判，图还在）
+      · 任意一轮探测失败 -> 记为未知（保留，宁可留着也不删）
+      · 全是 404        -> 再去旧域名试一次，能出图同样撤销
+    只有全程 404 的才返回 confirmed。
+    """
+    base = host.rstrip("/")
+    if not base.startswith(("http://", "https://")):
+        base = "https://" + base
+    legacy = "https://" + LEGACY_HOST
+    confirmed: dict[str, str] = {}
+    revived: dict[str, str] = {}
+    unsure: dict[str, str] = {}
+    # 旧域名在国内经常连不上，连续两次网络层失败就不再试了，免得每条都卡满超时
+    legacy_state = {"enabled": bool(cross_host), "fail": 0}
+
+    def try_legacy(path: str) -> str | None:
+        if not legacy_state["enabled"]:
+            return None
+        st, detail = probe_image(f"{legacy}/ugc/{path}", timeout=6.0, retries=0)
+        if st == ALIVE:
+            return detail
+        if st == UNKNOWN and not detail.startswith("HTTP"):
+            legacy_state["fail"] += 1
+            if legacy_state["fail"] >= 2:
+                legacy_state["enabled"] = False
+        return None
+
+    def one(path: str) -> tuple[str, str, str]:
+        for r in range(max(1, rounds)):
+            time.sleep(delay + random.uniform(0, 0.4))
+            st, detail = probe_image(f"{base}/ugc/{path}")
+            if st == ALIVE:
+                return path, ALIVE, f"复核第 {r + 1} 轮又出图了（{detail}），撤销删除"
+            if st == UNKNOWN:
+                return path, UNKNOWN, f"复核第 {r + 1} 轮探测失败（{detail}），这条先留着"
+        hit = try_legacy(path)
+        if hit:
+            return path, ALIVE, f"旧域名仍能访问（{hit}），撤销删除"
+        return path, DEAD, f"连续 {max(1, rounds)} 轮复核仍为 404"
+
+    total = len(paths)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+        for path, st, detail in pool.map(one, paths):
+            done += 1
+            if st == DEAD:
+                confirmed[path] = detail
+            elif st == ALIVE:
+                revived[path] = detail
+            else:
+                unsure[path] = detail
+            if not quiet:
+                tag = {DEAD: "确认删除", ALIVE: "撤销", UNKNOWN: "存疑"}[st]
+                print(f"  [{done:>3}/{total}] {path[:44].ljust(44)} {tag}  {detail}")
+    return confirmed, revived, unsure
 
 
 def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
                threads: int = 4, dry_run: bool = False, force: bool = False,
                max_ratio: float = 0.5, min_total: int = 10,
                quiet: bool = False, history: Path | None = None,
-               write_history: bool = True, source: str = "local") -> int:
+               write_history: bool = True, source: str = "local",
+               confirm: int = 2, confirm_delay: float = 1.2,
+               cross_host: bool = True) -> int:
     """探测并剔除 src 里的失效条目。支持两种文件格式：
 
       {"pics":  ["<ugc 路径>", ...]}                  —— 站点索引 r.json
@@ -315,6 +440,9 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
     if not isinstance(data, dict):
         print(f"[错误] {src} 的顶层不是对象", file=sys.stderr)
         return 1
+
+    # 域名统一成裸主机名，避免配置里带了 https:// 时记录里拼出两遍协议头
+    host = re.sub(r"^https?://", "", (host or DEFAULT_HOST).strip().rstrip("/")) or DEFAULT_HOST
 
     is_pics = isinstance(data.get("pics"), list)
     is_items = isinstance(data.get("items"), list)
@@ -344,6 +472,27 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
     result = classify(targets, host, delay=delay, threads=threads, quiet=quiet)
 
     dead = [p for p in targets if result[p][0] == DEAD]
+
+    # 复核：首次 404 不等于真删了。CDN 某个边缘节点、一次 DNS 抖动、
+    # 甚至 Steam 侧短暂维护，都可能让一张好图返回 404。
+    if dead and confirm > 0:
+        print()
+        print(f"[复核] {len(dead)} 条疑似失效，逐条再确认（每条约 {confirm_delay}s × {confirm} 轮）")
+        confirmed, revived, unsure = confirm_dead(
+            dead, host, rounds=confirm, delay=confirm_delay,
+            cross_host=cross_host, threads=threads, quiet=quiet)
+        for p, detail in revived.items():
+            result[p] = (ALIVE, detail)
+        for p, detail in unsure.items():
+            result[p] = (UNKNOWN, detail)
+        for p, detail in confirmed.items():
+            result[p] = (DEAD, detail)
+        if revived:
+            print(f"[复核] {len(revived)} 条其实是活的，已撤销。")
+        if unsure:
+            print(f"[复核] {len(unsure)} 条复核时探测失败，按未知处理（保留）。")
+
+    dead = [p for p in targets if result[p][0] == DEAD]
     unknown = [p for p in targets if result[p][0] == UNKNOWN]
     alive = [p for p in targets if result[p][0] == ALIVE]
 
@@ -359,6 +508,9 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
             print(f"  ? {p}  ({result[p][1]})")
         if len(unknown) > 10:
             print(f"  ... 另有 {len(unknown) - 10} 条")
+        if os.environ.get("GITHUB_ACTIONS"):
+            # 让 Action 页面顶部也能看到这类"没判死但要留意"的情况
+            print(f"::warning::{len(unknown)} 条链接探测失败，已原样保留（未计入删除）")
 
     if not dead:
         print("[完成] 没有需要剔除的条目")
@@ -372,6 +524,11 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
     if not force and total >= min_total and len(dead) / total > max_ratio:
         print(f"[中止] 本次失效 {len(dead)}/{total}，超过阈值 {max_ratio:.0%}。", file=sys.stderr)
         print("       可能是 CDN 对我们限流了。确认无误时加 --force 重跑。", file=sys.stderr)
+        return 2
+    if not force and not alive and unknown:
+        print(f"[中止] 一条都没探活：失效 {len(dead)}、未知 {len(unknown)}。", file=sys.stderr)
+        print("       这更像地区封锁 / DNS 故障 / CDN 临时限制，而不是图全被删。", file=sys.stderr)
+        print("       过一会儿重跑；确认无误再加 --force。", file=sys.stderr)
         return 2
 
     if dry_run:
@@ -392,9 +549,9 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
         data["items"] = kept
 
     bak = src.with_suffix(src.suffix + ".bak")
-    bak.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    atomic_write(bak, src.read_text(encoding="utf-8"))
     # 注意：只改 pics / items 两个字段，其它键原样保留，文件形状不变
-    src.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write(src, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     print(f"[完成] 已剔除 {len(dead)} 条，写回 {src}（备份 {bak.name}）")
 
     if write_history:
@@ -428,6 +585,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--history", help=f"删图记录文件（默认与 --src 同目录的 {HISTORY_NAME}）")
     ap.add_argument("--no-history", action="store_true", help="不写删图记录")
     ap.add_argument("--source", default="local", help="记录里的来源标签（local / action）")
+    ap.add_argument("--confirm", type=int, default=2,
+                    help="判死后复核几轮（默认 2，任意一轮出图就撤销；0 = 不复核，危险）")
+    ap.add_argument("--confirm-delay", type=float, default=1.2,
+                    help="复核每轮之间隔几秒（默认 1.2）")
+    ap.add_argument("--no-cross-check", action="store_true",
+                    help="不复用旧域名做交叉验证")
     a = ap.parse_args(argv)
 
     return prune_file(
@@ -436,6 +599,8 @@ def main(argv: list[str] | None = None) -> int:
         max_ratio=a.max_ratio, min_total=a.min_total, quiet=a.quiet,
         history=Path(a.history) if a.history else None,
         write_history=not a.no_history, source=a.source,
+        confirm=a.confirm, confirm_delay=a.confirm_delay,
+        cross_host=not a.no_cross_check,
     )
 
 
