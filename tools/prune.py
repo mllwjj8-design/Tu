@@ -450,51 +450,29 @@ def _strip_dead(data: dict, dead_set: set[str]) -> int:
     return removed
 
 
-CATEGORIES_NAME = "categories.json"
+def site_index_files(site_dir: Path, exclude: Path | None = None) -> list[Path]:
+    """站点目录里需要跟着一起清理的索引。
 
-
-def refresh_category_counts(site_dir: Path) -> bool:
-    """按实际索引文件重算 categories.json 里的条数。
-
-    分类文件的条数是在 export 时写死的，Action 悄悄剔了几条之后，
-    画廊标签上还挂着旧数字 —— 那种"明明删除成功了但页面显示没变"最容易被当成故障。
+    判断依据是"这个 JSON 顶层有 pics 数组"，不靠文件名形状：
+    分类改名、加减类目都不用动这里，deleted_history.json 之类也不会被误删。
     """
-    f = Path(site_dir) / CATEGORIES_NAME
-    if not f.is_file():
-        return False
-    try:
-        d = json.loads(f.read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    if not isinstance(d, dict) or not isinstance(d.get("categories"), list):
-        return False
-
-    def size(idx: str) -> int | None:
-        p = Path(site_dir) / idx
-        if not p.is_file():
-            return None
-        try:
-            v = json.loads(p.read_text(encoding="utf-8")).get("pics")
-            return len(v) if isinstance(v, list) else None
-        except Exception:
-            return None
-
-    changed = False
-    for c in d["categories"]:
-        if not isinstance(c, dict) or not c.get("index"):
+    out: list[Path] = []
+    d = Path(site_dir)
+    if not d.is_dir():
+        return out
+    ex = exclude.resolve() if exclude else None
+    for p in sorted(d.glob("*.json")):
+        if p.name == HISTORY_NAME:
             continue
-        n = size(str(c["index"]))
-        if n is not None and c.get("count") != n:
-            c["count"] = n
-            changed = True
-    total = size("r.json")
-    if total is not None and d.get("total") != total:
-        d["total"] = total
-        changed = True
-    if changed:
-        atomic_write(f, json.dumps(d, ensure_ascii=False, indent=2) + "\n")
-        print(f"[同步] 已按实际条数更新 {CATEGORIES_NAME}")
-    return changed
+        if ex and p.resolve() == ex:
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("pics"), list):
+            out.append(p)
+    return out
 
 
 def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
@@ -654,7 +632,6 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
         except Exception as e:
             print(f"[警告] 同步 {f} 失败（未改动）：{e}", file=sys.stderr)
 
-    refresh_category_counts(src.parent)
 
     if write_history:
         hp = history or src.with_name(HISTORY_NAME)
@@ -668,26 +645,6 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
         extra = f"，{skipped} 条此前已有记录" if skipped else ""
         print(f"[记录] 已写入 {hp}（本次新增 {added} 条{extra}，累计 {total_kept} 条）")
     return 0
-
-
-def site_index_files(site_dir: Path, exclude: Path | None = None) -> list[Path]:
-    """站点目录里需要跟着一起清理的索引：full.json 和每个类目的 r.*.json / full.*.json。
-
-    只认 r.json / r.<slug>.json / full.json / full.<slug>.json 这四种形状，
-    免得把 deleted_history.json、categories.json 之类误当成图库索引去删。
-    """
-    out: list[Path] = []
-    d = Path(site_dir)
-    if not d.is_dir():
-        return out
-    ex = exclude.resolve() if exclude else None
-    for p in sorted(d.glob("*.json")):
-        if not re.fullmatch(r"(?:r|full)(?:\.[a-z0-9_-]+)?\.json", p.name):
-            continue
-        if ex and p.resolve() == ex:
-            continue
-        out.append(p)
-    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -714,8 +671,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-cross-check", action="store_true",
                     help="不复用旧域名做交叉验证")
     ap.add_argument("--extra", nargs="*", default=[],
-                    help="额外同步处理的索引文件（full.json、各类目的 r.*.json）")
-    ap.add_argument("--site", help="站点目录：自动把里面的 full.json / r.*.json / full.*.json 一并同步")
+                    help="额外同步处理的索引文件（同目录的 p.json / r.json / *.full.json）")
+    ap.add_argument("--site", help="站点目录：自动把里面所有含 pics 的索引一并同步")
     a = ap.parse_args(argv)
 
     extra = [Path(p) for p in (a.extra or [])]

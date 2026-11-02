@@ -27,9 +27,19 @@ jobs:
       - name: 探测并剔除失效链接
         id: prune
         continue-on-error: true
-        # --site . 会把 full.json 和每个类目的 r.*.json / full.*.json 一起同步清理，
-        # 否则分类索引里会留下 r.json 已经删掉的幽灵条目
-        run: python tools/prune.py --src r.json --site . --apply --source action
+        # 两类索引逐个跑：每一类各过各的安全阀，某类整体探测失败只会中止那一类。
+        # --site . 会把同目录其余索引（含 .full 版）里的同一条死链一起摘掉。
+        run: |
+          for f in p.json r.json; do
+            if [ ! -f "$f" ]; then continue; fi
+            echo "::group::清理 $f"
+            if python tools/prune.py --src "$f" --site . --apply --source action; then
+              echo "$f 清理完成"
+            else
+              echo "::warning::$f 的清理被安全阀拦下或出错，已跳过（下次再试）"
+            fi
+            echo "::endgroup::"
+          done
 
       - name: 有变化就提交
         run: |
@@ -40,7 +50,7 @@ jobs:
           rm -f *.bak
           git config user.name  "steambed-bot"
           git config user.email "steambed-bot@users.noreply.github.com"
-          # 分类索引是动态的（r.*.json / full.*.json），逐个列出来容易漏，直接全加。
+          # 索引文件是动态的（p.json / r.json 及 .full 版），不逐个列举，直接全加。
           # 仓库里只有站点文件，*.bak 已被 .gitignore 挡住，不会误提交。
           git add -A
           n=$(python -c "import json;print(json.load(open('deleted_history.json')).get('count',0))" 2>/dev/null || echo "?")

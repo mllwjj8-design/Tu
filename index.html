@@ -129,7 +129,7 @@
 
 <main id="grid"></main>
 <nav id="pager"></nav>
-<footer>图片托管于 Steam 图片 CDN（images.steamusercontent.com）　索引：<a href="r.json">r.json</a></footer>
+<footer>图片托管于 Steam 图片 CDN（images.steamusercontent.com）　索引：<a href="p.json">p.json</a> / <a href="r.json">r.json</a></footer>
 
 <div id="lb">
   <button class="arrow" id="lbPrev" type="button">‹</button>
@@ -151,6 +151,9 @@ const THUMB = "?imw=520&imh=520&impolicy=Letterbox";
 
 let PICS = [], view = [], page = 1, sel = new Set(), selMode = false, lbIdx = -1;
 let CATS = [], DATA = {}, curCat = "";
+// 类目清单由 export 直接写进页面：线上不再需要多请求一个 categories.json，
+// 少一个文件就少一处"改了索引忘了改类目"的错位。
+const CATS_CFG = [{"slug":"p","name":"普通","index":"p.json","count":0},{"slug":"r","name":"R 级","index":"r.json","count":0}];
 
 const $ = s => document.querySelector(s);
 const grid = $("#grid"), pager = $("#pager");
@@ -206,34 +209,34 @@ function pickCat(slug){
     });
 }
 
-// 线上：先读类目清单，再按类目拉对应的索引文件。
-// categories.json 不存在（老站点 / 没配分类）时退化成只读 r.json，行为跟以前一致。
+// 线上：类目已经在页面里，按类目拉对应的索引文件即可。
+// 没有类目信息时退化成只读 r.json，行为跟老版本一致。
 function load(){
-  fetch("categories.json", { cache: "no-store" })
+  if (CATS_CFG && CATS_CFG.length){
+    setCats(CATS_CFG);
+    pickCat(CATS_CFG[0].slug);
+    return;
+  }
+  setCats([]);
+  fetch("r.json", { cache: "no-store" })
     .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(d => {
-      if (!d || !Array.isArray(d.categories) || !d.categories.length) throw new Error("无类目");
-      setCats(d.categories);
-      pickCat("all");
-    })
-    .catch(() => {
-      setCats([]);
-      fetch("r.json", { cache: "no-store" })
-        .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(d => boot(Array.isArray(d) ? d : d.pics))
-        .catch(e => {
-          grid.innerHTML = '<p class="empty">读取索引失败：' + e.message +
-            '<br>若是 file:// 直接双击打开的，请改用 gallery.html 或本地服务器。</p>';
-        });
+    .then(d => boot(Array.isArray(d) ? d : d.pics))
+    .catch(e => {
+      grid.innerHTML = '<p class="empty">读取索引失败：' + e.message +
+        '<br>若是 file:// 直接双击打开的，请改用 gallery.html 或本地服务器。</p>';
     });
 }
 
 // 本地：所有索引内容都内联在 DATA 里，双击就能开，不需要服务器
 function bootInline(data){
   DATA = data || {};
-  setCats(DATA.__cats || []);
-  if (CATS.length) pickCat("all");
-  else boot(DATA["r.json"] || []);
+  if (CATS_CFG && CATS_CFG.length){
+    setCats(CATS_CFG);
+    pickCat(CATS_CFG[0].slug);
+  } else {
+    setCats([]);
+    boot(DATA["r.json"] || []);
+  }
 }
 
 function apply(){
