@@ -15,6 +15,11 @@
   2. 失效比例 > --max-ratio（默认 50%）且总数 >= --min-total（默认 10）-> 拒绝剔除
      （确认无误时加 --force 跳过）
 
+删图记录：
+  每次剔除都会把条目追加进 deleted_history.json（只增不删、按时间倒序、按路径去重），
+  所以"删了哪些、什么时候删的、当时报什么错"永远查得到，即使 r.json 早已清空。
+  本地与 Action 写的是同一份结构，export 会把两份合并成站点里的那一份。
+
 退出码：0 成功 / 1 出错 / 2 被安全阀拦下
 """
 
@@ -27,11 +32,14 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 DEFAULT_HOST = "images.steamusercontent.com"
+HISTORY_NAME = "deleted_history.json"
+BJ_TZ = timezone(timedelta(hours=8))  # 删图时间统一按北京时间记录
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -96,6 +104,109 @@ def probe_image(url: str, timeout: float = 15.0, retries: int = 2) -> tuple[str,
     return UNKNOWN, last or "探测失败"
 
 
+def now_iso() -> str:
+    """当前时间，带 +08:00 偏移，跟人看到的北京时间一致。"""
+    return datetime.now(BJ_TZ).isoformat(timespec="seconds")
+
+
+def load_history(path: Path) -> dict:
+    """读删图记录；文件不存在或损坏时返回空结构，绝不因此中断清理。"""
+    empty = {"version": 1, "items": []}
+    if not path.is_file():
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return empty
+    return data
+
+
+def save_history(path: Path, data: dict) -> bool:
+    """按路径去重、按时间倒序后写回。返回内容是否真的变了。"""
+    seen: set[str] = set()
+    items: list[dict] = []
+    for it in data.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        p = str(it.get("path") or "")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        items.append(it)
+    items.sort(key=lambda x: str(x.get("removed_at") or ""), reverse=True)
+
+    out = {
+        "version": 1,
+        "count": len(items),
+        "note": ("Steam 图床的删图记录。每次清理判定为已删除（HTTP 404/410）的图片都会记一条，"
+                 "按时间倒序、按路径去重，只增不删；清空 r.json 也不会清掉这里。"),
+        "items": items,
+    }
+    text = json.dumps(out, ensure_ascii=False, indent=2) + "\n"
+    old = path.read_text(encoding="utf-8") if path.is_file() else ""
+    if old == text:
+        return False
+    if not items and not path.is_file():
+        # 从来没删过图，就别造一个空文件出来
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def append_history(history: Path, records: list[dict]) -> tuple[int, int]:
+    """把本次删除的条目追加进记录，返回 (本次新增, 累计条数)。已有路径不重复记。"""
+    data = load_history(history)
+    known = {str(it.get("path") or "") for it in data.get("items") or []}
+    added = 0
+    for rec in records:
+        if rec.get("path") in known:
+            continue
+        data.setdefault("items", []).append(rec)
+        known.add(rec.get("path"))
+        added += 1
+    save_history(history, data)
+    return added, len(data.get("items") or [])
+
+
+def merge_history(dst: Path, *extra: Path) -> int:
+    """把多份记录合并进 dst（export 用：本地删的也要出现在站点记录里）。
+
+    同一路径保留最早的那条 removed_at —— 第一次被判定删除的时间才是真的。
+    """
+    by_path: dict[str, dict] = {}
+    for src in (dst, *extra):
+        for it in load_history(src).get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            p = str(it.get("path") or "")
+            if not p:
+                continue
+            old = by_path.get(p)
+            if old is None or str(it.get("removed_at") or "") < str(old.get("removed_at") or ""):
+                by_path[p] = it
+    save_history(dst, {"version": 1, "items": list(by_path.values())})
+    return len(by_path)
+
+
+def _record(path: str, detail: str, host: str, *, source: str,
+            extra: dict | None = None) -> dict:
+    rec = {
+        "path": path,
+        "url": f"https://{host.rstrip('/')}/ugc/{path}",
+        "removed_at": now_iso(),
+        "reason": detail,
+        "source": source or "local",
+    }
+    for k in ("name", "local", "appid"):
+        v = (extra or {}).get(k)
+        if v:
+            rec[k] = v
+    return rec
+
+
 def classify(pics: list[str], host: str = DEFAULT_HOST, *, delay: float = 0.15,
              threads: int = 4, quiet: bool = False) -> dict[str, tuple[str, str]]:
     """并发探测一批 UGC 路径，返回 {path: (状态, 说明)}。"""
@@ -135,7 +246,8 @@ def _ugc_path(url: str) -> str | None:
 def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
                threads: int = 4, dry_run: bool = False, force: bool = False,
                max_ratio: float = 0.5, min_total: int = 10,
-               quiet: bool = False) -> int:
+               quiet: bool = False, history: Path | None = None,
+               write_history: bool = True, source: str = "local") -> int:
     """探测并剔除 src 里的失效条目。支持两种文件格式：
 
       {"pics":  ["<ugc 路径>", ...]}                  —— 站点索引 r.json
@@ -164,10 +276,13 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
 
     # 统一成"待探测的 UGC 路径"
     targets: list[str] = list(pics) if is_pics else []
+    item_by_path: dict[str, dict] = {}
     for it in items:
         p = _ugc_path(str(it.get("url") or ""))
-        if p and p not in targets:
-            targets.append(p)
+        if p:
+            item_by_path.setdefault(p, it)
+            if p not in targets:
+                targets.append(p)
 
     total = len(targets)
     if total == 0:
@@ -209,7 +324,8 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
         return 2
 
     if dry_run:
-        print(f"[预演] 只报告不改文件。实际会剔除 {len(dead)} 条，加 --apply 才写入")
+        print(f"[预演] 只报告不改文件。实际会剔除 {len(dead)} 条并记入删图记录，"
+              f"加 --apply 才写入")
         return 0
 
     dead_set = set(dead)
@@ -229,6 +345,18 @@ def prune_file(src: Path, *, host: str = DEFAULT_HOST, delay: float = 0.15,
     # 注意：只改 pics / items 两个字段，其它键原样保留，文件形状不变
     src.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[完成] 已剔除 {len(dead)} 条，写回 {src}（备份 {bak.name}）")
+
+    if write_history:
+        hp = history or src.with_name(HISTORY_NAME)
+        records = [
+            _record(p, result[p][1], host, source=source,
+                    extra=item_by_path.get(p))
+            for p in dead
+        ]
+        added, total_kept = append_history(hp, records)
+        skipped = len(records) - added
+        extra = f"，{skipped} 条此前已有记录" if skipped else ""
+        print(f"[记录] 已写入 {hp}（本次新增 {added} 条{extra}，累计 {total_kept} 条）")
     return 0
 
 
@@ -246,12 +374,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-ratio", type=float, default=0.5, help="单次允许的失效比例上限")
     ap.add_argument("--min-total", type=int, default=10, help="低于这个总数不套用比例阈值")
     ap.add_argument("--quiet", action="store_true", help="不逐条打印")
+    ap.add_argument("--history", help=f"删图记录文件（默认与 --src 同目录的 {HISTORY_NAME}）")
+    ap.add_argument("--no-history", action="store_true", help="不写删图记录")
+    ap.add_argument("--source", default="local", help="记录里的来源标签（local / action）")
     a = ap.parse_args(argv)
 
     return prune_file(
         Path(a.src), host=a.host, delay=a.delay, threads=a.threads,
         dry_run=a.dry_run or not a.apply, force=a.force,
         max_ratio=a.max_ratio, min_total=a.min_total, quiet=a.quiet,
+        history=Path(a.history) if a.history else None,
+        write_history=not a.no_history, source=a.source,
     )
 
 

@@ -1,12 +1,18 @@
 name: prune
 
+# 每 7 天清理一次：北京时间每周一 03:17
+# （cron 用 UTC，周日 19:17 UTC = 周一 03:17 北京时间）
 on:
   schedule:
-    - cron: "17 19 * * *"
+    - cron: "17 19 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: prune
+  cancel-in-progress: false
 
 jobs:
   prune:
@@ -21,16 +27,19 @@ jobs:
       - name: 探测并剔除失效链接
         id: prune
         continue-on-error: true
-        run: python tools/prune.py --src r.json --apply
+        run: python tools/prune.py --src r.json --apply --source action
 
       - name: 有变化就提交
         run: |
-          if git diff --quiet -- r.json; then
-            echo "索引没有变化，跳过提交"
+          if [ -z "$(git status --porcelain -- r.json deleted_history.json)" ]; then
+            echo "索引与删图记录都没有变化，跳过提交"
             exit 0
           fi
+          rm -f r.json.bak
           git config user.name  "steambed-bot"
           git config user.email "steambed-bot@users.noreply.github.com"
           git add r.json
-          git commit -m "prune: 移除已失效的图片链接"
-          git push
+          git add deleted_history.json 2>/dev/null || true
+          n=$(python -c "import json;print(json.load(open('deleted_history.json')).get('count',0))" 2>/dev/null || echo "?")
+          git commit -m "prune: 移除已失效的图片链接（删图记录累计 ${n} 条）"
+          git push origin HEAD

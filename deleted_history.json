@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "count": 3,
+  "note": "Steam 图床的删图记录。每次清理判定为已删除（HTTP 404/410）的图片都会记一条，按时间倒序、按路径去重，只增不删；清空 r.json 也不会清掉这里。",
+  "items": [
+    {
+      "path": "16394069585991889110/491F470414CBBE2771A587D039931C47CE9219C1/",
+      "url": "https://images.steamusercontent.com/ugc/16394069585991889110/491F470414CBBE2771A587D039931C47CE9219C1/",
+      "removed_at": "2026-11-02T04:00:00+08:00",
+      "reason": "HTTP 404（11-02 复核确认，补录）",
+      "source": "backfill",
+      "name": "20110212145550_1",
+      "local": "pics/暻巻 thanks_1920.bmp",
+      "appid": "1203220",
+      "backfilled": true
+    },
+    {
+      "path": "14052134573521888803/1CC9AF5F7013831492C8266076F834B8AAFA304B/",
+      "url": "https://images.steamusercontent.com/ugc/14052134573521888803/1CC9AF5F7013831492C8266076F834B8AAFA304B/",
+      "removed_at": "2026-11-02T04:00:00+08:00",
+      "reason": "HTTP 404（11-02 复核确认，补录）",
+      "source": "backfill",
+      "name": "20240904233204_1",
+      "local": "pics/96C6664CD393538750059489B30E870043ED847F.png",
+      "appid": "1203220",
+      "backfilled": true
+    },
+    {
+      "path": "9335317399605374605/302503DF130D3480E105FCADD571CD3F3284C18C/",
+      "url": "https://images.steamusercontent.com/ugc/9335317399605374605/302503DF130D3480E105FCADD571CD3F3284C18C/",
+      "removed_at": "2026-11-02T04:00:00+08:00",
+      "reason": "HTTP 404（11-02 复核确认，补录）",
+      "source": "backfill",
+      "name": "20260311185300_1",
+      "local": "pics/79713014_p0.png",
+      "appid": "1203220",
+      "backfilled": true
+    }
+  ]
+}
