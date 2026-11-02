@@ -123,8 +123,49 @@ def load_history(path: Path) -> dict:
     return data
 
 
-def save_history(path: Path, data: dict) -> bool:
-    """按路径去重、按时间倒序后写回。返回内容是否真的变了。"""
+def render_history_md(data: dict) -> str:
+    """把删图记录渲染成一张可读的表格，供人直接翻。"""
+    items = [i for i in data.get("items") or [] if isinstance(i, dict)]
+    lines = [
+        "# 删图记录",
+        "",
+        "Steam 图床上被判定为已删除（HTTP 404 / 410）的图片。**只增不删**——",
+        "即使 `r.json` 已经清空、图早就没了，这份历史也还在。",
+        "",
+        f"- 累计：**{len(items)}** 条",
+        f"- 最近更新：{items[0].get('removed_at', '') if items else '—'}",
+        "- 机器可读版：`deleted_history.json`（由每 7 天的清理任务自动维护）",
+        "",
+    ]
+    if not items:
+        lines += ["暂时没有删图记录。", ""]
+        return "\n".join(lines)
+
+    src_label = {"action": "云端定时", "local": "本机 sync", "backfill": "历史补录"}
+    lines += [
+        "| # | 删除时间（北京时间） | 文件名 | 直链路径 | 判定 | 来源 |",
+        "|---|---|---|---|---|---|",
+    ]
+    for n, it in enumerate(items, 1):
+        name = str(it.get("name") or "—").replace("|", "\\|")
+        path = str(it.get("path") or "").replace("|", "\\|")
+        when = str(it.get("removed_at") or "").replace("T", " ")[:19]
+        src = src_label.get(str(it.get("source")), str(it.get("source") or ""))
+        lines.append(f"| {n} | {when} | {name} | `{path}` | {it.get('reason', '')} | {src} |")
+    lines += [
+        "",
+        "> 完整地址 = `https://images.steamusercontent.com/ugc/` + 直链路径",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def save_history(path: Path, data: dict, *, write_md: bool = True) -> bool:
+    """按路径去重、按时间倒序后写回。返回 JSON 内容是否真的变了。
+
+    JSON 旁边会同步生成同名 `.md` 表格，本地和 Action 走同一段代码，
+    不会出现「云端删了图、表格还是旧的」这种情况。
+    """
     seen: set[str] = set()
     items: list[dict] = []
     for it in data.get("items") or []:
@@ -146,14 +187,24 @@ def save_history(path: Path, data: dict) -> bool:
     }
     text = json.dumps(out, ensure_ascii=False, indent=2) + "\n"
     old = path.read_text(encoding="utf-8") if path.is_file() else ""
-    if old == text:
-        return False
-    if not items and not path.is_file():
+    if not items and not old:
         # 从来没删过图，就别造一个空文件出来
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return True
+
+    changed = old != text
+    if changed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    if write_md:
+        md_path = path.with_suffix(".md")
+        md = render_history_md(out)
+        old_md = md_path.read_text(encoding="utf-8") if md_path.is_file() else ""
+        if md != old_md:
+            md_path.parent.mkdir(parents=True, exist_ok=True)
+            md_path.write_text(md, encoding="utf-8")
+
+    return changed
 
 
 def append_history(history: Path, records: list[dict]) -> tuple[int, int]:
