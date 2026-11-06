@@ -205,7 +205,12 @@ function pickCat(slug){
     .then(r => { if (!r.ok) throw new Error(c.index + " HTTP " + r.status); return r.json(); })
     .then(d => boot(Array.isArray(d) ? d : d.pics))
     .catch(e => {
-      grid.innerHTML = '<p class="empty">读取 ' + c.index + ' 失败：' + e.message + '</p>';
+      const hint = location.protocol === "file:"
+        ? "<br>这是 file:// 双击打开的本地文件，浏览器不允许它读取同目录的 " + c.index + "。" +
+          "<br>两个办法：① 打开本目录下的 gallery.html（索引已内联，双击即用）；" +
+          "② 在本目录执行 python -m http.server 8000，再访问 http://localhost:8000/"
+        : "<br>确认 " + c.index + " 与本页在同一目录，或服务器返回了错误。";
+      grid.innerHTML = '<p class="empty">读取 ' + c.index + ' 失败：' + e.message + hint + '</p>';
     });
 }
 
